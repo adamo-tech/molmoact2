@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -9,7 +10,10 @@ repository = Path(__file__).parents[1]
 context = Path(tempfile.mkdtemp())
 (context / "molmoact2").mkdir()
 archive = subprocess.run(
-    ["git", "-C", repository, "archive", "HEAD"], capture_output=True, check=True
+    ["git", "-C", repository, "archive", "HEAD"],
+    capture_output=True,
+    check=True,
+    env={**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"},
 ).stdout
 subprocess.run(["tar", "-x", "-C", context / "molmoact2"], input=archive, check=True)
 subprocess.run(
