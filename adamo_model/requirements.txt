@@ -1,0 +1,13 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+transformers==5.5.4
+peft==0.18.1
+scipy
+lerobot[dataset,molmoact2] @ git+https://github.com/huggingface/lerobot.git@afbf3f14a13bdad3e5990e2bed629c6539605658
+fastapi
+uvicorn
+aiohttp
+fsspec[gcs,http,s3]>=2024.6.0
+google-crc32c
+adamo==1.0.18
