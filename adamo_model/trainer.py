@@ -59,6 +59,7 @@ def right_padded(batch):
 class Trainer:
     base_model = "allenai/MolmoAct2"
     action_horizon = model.ACTION_HORIZON
+    is_episode_end_padded = True
 
     def __init__(self, rank, frames, state_directory=None, seed=None, parts=None):
         self.rank = rank
