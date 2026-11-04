@@ -5,12 +5,14 @@ import json
 import math
 import random
 
+from lerobot.policies.molmoact2.molmoact2_hf_model.modeling_molmoact2 import ViTMultiHeadDotProductAttention
 from lerobot.utils.constants import ACTION, OBS_STATE
 import numpy
 from peft.helpers import disable_input_dtype_casting
 from PIL import Image
 from safetensors.torch import save_file
 import torch
+from training.flops import counted_flops
 
 from adamo_model import model
 
@@ -26,11 +28,12 @@ MAPPING_KEYS = ("images", "state", "action", "frame_rate", "state_sizes", "actio
 def example(datum, frames):
     frame_images = {}
     images = {}
+    image_keys = list(datum["images"])
 
     for key, image in datum["images"].items():
         if isinstance(image, dict):
             pointer = (image["dataset"], image["episode"], image["frame"])
-            frame_images[pointer] = frame_images.get(pointer) or frames.frame(*pointer)
+            frame_images[pointer] = frame_images.get(pointer) or frames.frame(*pointer, image_keys)
             image = frame_images[pointer][key]
 
         if isinstance(image, bytes):
@@ -47,6 +50,12 @@ def example(datum, frames):
     return images, state, actions, datum["prompt"]
 
 
+def right_padded(batch):
+    order = torch.argsort(batch["attention_mask"], dim=1, descending=True, stable=True)
+    moved = {key: value.gather(1, order) if isinstance(value, torch.Tensor) and value.shape == order.shape else value for key, value in batch.items()}
+    return {**moved, "position_ids": moved["attention_mask"].cumsum(1) - 1}
+
+
 class Trainer:
     base_model = "allenai/MolmoAct2"
     action_horizon = model.ACTION_HORIZON
@@ -60,6 +69,7 @@ class Trainer:
         self.episodes = []
         self.policy = None
         self.step_count = 0
+        self.example_flops = None
         self.preparers = concurrent.futures.ThreadPoolExecutor(max_workers=PREPARE_THREAD_COUNT)
 
         if state_directory:
@@ -89,6 +99,16 @@ class Trainer:
             self.checkpoint, self.mapping, statistics, lora_rank=self.rank, is_training=True
         )
         self.policy.train()
+        backbone = self.policy._backbone()
+        backbone._build_native_attention_bias = lambda **kwargs: None
+
+        for block in backbone.transformer.blocks:
+            block.compile(options={"emulate_precision_casts": True})
+
+        for module in self.policy.modules():
+            if isinstance(module, ViTMultiHeadDotProductAttention):
+                module.float32_attention = False
+
         self.params = [parameter for parameter in self.policy.parameters() if parameter.requires_grad]
         self.optimizer = torch.optim.AdamW(self.params, lr=0.0)
 
@@ -157,6 +177,9 @@ class Trainer:
             self.start(self.run_statistics(data))
 
         examples = list(self.preparers.map(example, data, itertools.repeat(self.frames)))
+        return self.batches(examples), self.batches(examples[:1])
+
+    def batches(self, examples):
         batches = []
 
         for index in range(0, len(examples), CHUNK_SIZE):
@@ -167,11 +190,11 @@ class Trainer:
                 list(prompts),
             )
             actions = [model.clipped_passthrough(action, self.statistics[ACTION]) for action in actions]
-            batches.append(self.preprocessor({**batch, ACTION: torch.from_numpy(numpy.stack(actions))}))
+            batches.append(right_padded(self.preprocessor({**batch, ACTION: torch.from_numpy(numpy.stack(actions))})))
 
         return batches
 
-    def forward_backward(self, batches, example_count):
+    def local_forward_backward(self, batches, example_count):
         loss = 0.0
 
         with disable_input_dtype_casting(self.policy.model):
@@ -181,7 +204,15 @@ class Trainer:
                 (batch_loss * weight).backward()
                 loss += batch_loss.item() * weight
 
-        return {"loss": loss, "metrics": {}}
+        return loss
+
+    def forward_backward(self, prepared, example_count):
+        batches, example_batches = prepared
+        self.example_flops = self.example_flops or counted_flops(
+            lambda: self.local_forward_backward(example_batches, 1), self.params
+        )
+        loss = self.local_forward_backward(batches, example_count)
+        return {"loss": loss, "flops": self.example_flops * example_count, "metrics": {}}
 
     def optim_step(self, adam_params):
         for group in self.optimizer.param_groups:

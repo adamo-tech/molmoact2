@@ -131,6 +131,7 @@ def policy(checkpoint_directory, mapping, statistics, lora_rank=None, is_trainin
         train_mode_vlm="lora" if lora_rank else "fft",
         lora_rank=lora_rank or MolmoAct2Config.lora_rank,
         gradient_checkpointing=is_training,
+        compile_model=is_training,
         device="cuda",
     )
     preprocessor, postprocessor = make_molmoact2_pre_post_processors(config, dataset_stats=statistics)

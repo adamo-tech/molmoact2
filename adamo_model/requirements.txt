@@ -11,3 +11,5 @@ aiohttp
 fsspec[gcs,http,s3]>=2024.6.0
 google-crc32c
 adamo==1.0.18
+nvidia-ml-py
+torchcodec==0.11.1+cu128
