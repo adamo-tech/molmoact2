@@ -3,11 +3,14 @@ import json
 from lerobot.lerobot_types import TransitionKey
 from lerobot.utils.constants import OBS_STATE
 from lerobot.policies.molmoact2.molmoact2_hf_model import inference
-from lerobot.policies.molmoact2.processor_molmoact2 import MolmoAct2MaskedNormalizerProcessorStep
+from lerobot.policies.molmoact2.processor_molmoact2 import MolmoAct2MaskedNormalizerProcessorStep, MolmoAct2PackInputsProcessorStep
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
+import numpy
 from runtime import model_storage
 import torch
+import torchvision
+from transformers import BatchFeature
 
 from adamo_model import model
 from adamo_model.trainer import STATISTICS_FILE, TRAINABLE_FILE
@@ -43,6 +46,29 @@ def guidance_weight(t):
     return min((1 - t) / t * ((1 - t) ** 2 + t**2) / (1 - t) ** 2, MAX_GUIDANCE_WEIGHT)
 
 
+class CudaImageProcessor:
+    def __init__(self, image_processor):
+        self.image_processor = image_processor
+        self.layout_preprocess = image_processor.preprocess
+        self.layouts = {}
+        self.mean = torch.tensor(image_processor.image_mean, device="cuda")[:, None, None]
+        self.std = torch.tensor(image_processor.image_std, device="cuda")[:, None, None]
+
+    def patches(self, image):
+        size, patch = self.image_processor.size["height"], self.image_processor.patch_size
+        resized = torchvision.transforms.Resize([size, size], self.image_processor.resample, antialias=False)(image.permute(2, 0, 1))
+        pixels = ((resized.float() / 255.0 - self.mean) / self.std).permute(1, 2, 0)
+        return pixels.reshape(size // patch, patch, size // patch, patch, 3).permute(0, 2, 1, 3, 4).reshape(1, -1, patch * patch * 3)
+
+    def preprocess(self, images, **settings):
+        shapes = tuple(tuple(image.shape) for image in images)
+
+        if shapes not in self.layouts:
+            self.layouts[shapes] = self.layout_preprocess([numpy.zeros(shape, numpy.uint8) for shape in shapes], **settings)
+
+        return BatchFeature({**self.layouts[shapes], "pixel_values": torch.cat([self.patches(image) for image in images])})
+
+
 class MolmoAct2:
     def __init__(self, policy, preprocessor, postprocessor, statistics, mapping):
         self.policy = policy.eval().requires_grad_(False)
@@ -55,6 +81,9 @@ class MolmoAct2:
         self.action_expert = self.backbone._require_action_expert()
         self.preprocessor = preprocessor
         self.postprocessor = postprocessor
+        pack = next(step for step in preprocessor.steps if isinstance(step, MolmoAct2PackInputsProcessorStep))
+        pack._extract_images = lambda observation, batch_size: [[observation[key][0] for key in pack._resolve_image_keys(observation)]]
+        pack.processor.image_processor.preprocess = CudaImageProcessor(pack.processor.image_processor).preprocess
         self.normalizer = next(
             step for step in preprocessor.steps if isinstance(step, MolmoAct2MaskedNormalizerProcessorStep)
         )
@@ -156,11 +185,10 @@ class MolmoAct2:
 
     def infer(self, observation, prompt, prefix=None, inference_delay=0, real_time_chunking=True):
         batch = self.preprocessor(
-            model.batch(
-                {key: [image.cpu().numpy()] for key, image in observation["images"].items()},
-                [model.clipped_passthrough(observation["state"], self.state_statistics)],
-                [prompt],
-            )
+            {
+                **model.batch({}, [model.clipped_passthrough(observation["state"], self.state_statistics)], [prompt]),
+                **{model.IMAGE_PREFIX + key: image[None] for key, image in observation["images"].items()},
+            }
         )
         actions = (
             self.guided_actions(batch, prefix, inference_delay)
