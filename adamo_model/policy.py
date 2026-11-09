@@ -157,7 +157,7 @@ class MolmoAct2:
     def infer(self, observation, prompt, prefix=None, inference_delay=0, real_time_chunking=True):
         batch = self.preprocessor(
             model.batch(
-                {key: [image] for key, image in observation["images"].items()},
+                {key: [image.cpu().numpy()] for key, image in observation["images"].items()},
                 [model.clipped_passthrough(observation["state"], self.state_statistics)],
                 [prompt],
             )
