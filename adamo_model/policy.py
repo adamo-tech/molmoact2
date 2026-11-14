@@ -1,3 +1,4 @@
+import dataclasses
 import json
 
 from lerobot.lerobot_types import TransitionKey
@@ -17,6 +18,7 @@ from adamo_model.trainer import STATISTICS_FILE, TRAINABLE_FILE
 
 
 MAX_GUIDANCE_WEIGHT = RTCConfig.max_guidance_weight
+CONTEXT_LENGTH_MULTIPLE = 512
 
 
 def capture_cuda_graph(function, device, *, after_warmup):
@@ -37,6 +39,15 @@ def capture_cuda_graph(function, device, *, after_warmup):
 
 
 inference._capture_cuda_graph = capture_cuda_graph
+
+
+def padded_context(context):
+    padding = -context.cross_mask.shape[-1] % CONTEXT_LENGTH_MULTIPLE
+    return dataclasses.replace(
+        context,
+        kv_contexts=[(torch.nn.functional.pad(keys, (0, 0, 0, 0, 0, padding)), torch.nn.functional.pad(values, (0, 0, 0, 0, 0, padding))) for keys, values in context.kv_contexts],
+        cross_mask=torch.nn.functional.pad(context.cross_mask, (0, padding), value=torch.finfo(context.cross_mask.dtype).min),
+    )
 
 
 def guidance_weight(t):
@@ -93,7 +104,7 @@ class MolmoAct2:
         self.action_sizes = mapping.get("action_sizes")
         self.horizon = mapping["action_horizon"]
         self.refill_step_index = self.horizon // 2
-        self.graph_key = None
+        self.graphs = {}
 
     def normalized(self, actions):
         transition = {TransitionKey.ACTION: torch.from_numpy(actions[None]).to("cuda")}
@@ -118,7 +129,7 @@ class MolmoAct2:
         encoder_kv_states = self.backbone._apply_depth_gate_to_layer_kv_states(encoder_kv_states, depth_mask, depth_gate)
         noise = torch.randn(1, self.horizon, self.backbone.config.max_action_dim, device="cuda")
         trajectory = self.mask(noise, batch["action_dim_is_pad"])
-        context = self.action_expert.prepare_context(
+        context = padded_context(self.action_expert.prepare_context(
             encoder_kv_states=encoder_kv_states,
             encoder_attention_mask=encoder_attention_mask,
             state_embeddings=None,
@@ -126,7 +137,7 @@ class MolmoAct2:
             seq_len=self.horizon,
             device=trajectory.device,
             dtype=trajectory.dtype,
-        )
+        ))
         steps = int(self.backbone.config.flow_matching_num_steps)
         timesteps = [torch.full((1,), index / steps, device="cuda") for index in range(steps)]
         modulations = self.action_expert.get_or_prepare_modulation_cache(
@@ -154,22 +165,23 @@ class MolmoAct2:
     def replay_guided_flow(self, inputs, steps, prefix, weights):
         key = inference._cuda_graph_key(inputs, steps)
 
-        if key != self.graph_key:
-            self.graph_inputs = inference._clone_static_inputs(inputs)
-            self.graph_prefix = prefix.clone()
-            self.graph_weights = weights.clone()
-            self.graph, self.graph_output = capture_cuda_graph(
-                lambda: self.guided_flow(self.graph_inputs, steps, self.graph_prefix, self.graph_weights),
+        if key not in self.graphs:
+            graph_inputs = inference._clone_static_inputs(inputs)
+            graph_prefix = prefix.clone()
+            graph_weights = weights.clone()
+            graph, graph_output = capture_cuda_graph(
+                lambda: self.guided_flow(graph_inputs, steps, graph_prefix, graph_weights),
                 inputs.trajectory.device,
-                after_warmup=lambda: self.graph_inputs.trajectory.copy_(inputs.trajectory),
+                after_warmup=lambda: graph_inputs.trajectory.copy_(inputs.trajectory),
             )
-            self.graph_key = key
+            self.graphs[key] = graph, graph_inputs, graph_prefix, graph_weights, graph_output
 
-        inference._copy_inputs_(self.graph_inputs, inputs)
-        self.graph_prefix.copy_(prefix)
-        self.graph_weights.copy_(weights)
-        self.graph.replay()
-        return self.graph_output.clone()
+        graph, graph_inputs, graph_prefix, graph_weights, graph_output = self.graphs[key]
+        inference._copy_inputs_(graph_inputs, inputs)
+        graph_prefix.copy_(prefix)
+        graph_weights.copy_(weights)
+        graph.replay()
+        return graph_output.clone()
 
     def guided_actions(self, batch, prefix, inference_delay):
         action_size = self.policy._output_action_dim(batch)
@@ -197,7 +209,7 @@ class MolmoAct2:
         )
         robot_actions = self.postprocessor(actions)[0].numpy()
 
-        if real_time_chunking and self.graph_key is None:
+        if real_time_chunking and not self.graphs:
             self.guided_actions(batch, robot_actions[self.refill_step_index :], 0)
 
         return robot_actions
